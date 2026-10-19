@@ -1,5 +1,6 @@
 """핫딜 키워드 알림: 펨코 핫딜 + 뽐뿌게시판 (GitHub Actions에서 5분마다 실행).
 
+- 텔레그램 연결: TELEGRAM_CHAT_ID가 없으면 봇에게 처음 말 건 개인 채팅과 자동 연결
 - 텔레그램 명령 처리: /add 키워드, /del 키워드, /list, /help (또는 +키워드, -키워드)
 - 새 글 중 제목/쇼핑몰에 키워드가 들어간 글을 텔레그램으로 알림
 - 상태(키워드, 사이트별 이미 본 글 번호 등)는 state.json에 저장 → 워크플로가 커밋
@@ -23,7 +24,7 @@ BLOCK_BACKOFF_SEC = 3600  # 차단 의심 시 1시간 쉼
 SEEN_MAX = 400  # 사이트별로 기억할 최근 글 번호 수
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-CHAT_ID = str(os.environ.get("TELEGRAM_CHAT_ID", ""))
+CHAT_ID = str(os.environ.get("TELEGRAM_CHAT_ID", "")  # 비우면 자동 연결)
 
 
 # ---------- 상태 ----------
@@ -72,12 +73,23 @@ HELP = ("명령어\n"
         "대상: 펨코 핫딜, 뽐뿌게시판")
 
 
+def set_chat_id(st, chat_id):
+    global CHAT_ID
+    CHAT_ID = str(chat_id)
+    st["chat_id"] = CHAT_ID
+
+
 def handle_commands(st):
     res = tg("getUpdates", offset=st["tg_offset"], timeout=0)
     for upd in res.get("result", []):
         st["tg_offset"] = upd["update_id"] + 1
         msg = upd.get("message") or {}
-        if str(msg.get("chat", {}).get("id")) != CHAT_ID:
+        chat = msg.get("chat", {})
+        if not CHAT_ID and chat.get("type") == "private":
+            set_chat_id(st, chat["id"])  # 봇에게 처음 말 건 사람과 자동 연결
+            send("✅ 연결 완료. 이제 이 채팅으로 알림이 옴\n\n" + HELP)
+            continue
+        if str(chat.get("id")) != CHAT_ID:
             continue  # 내 채팅 외에는 무시
         text = (msg.get("text") or "").strip()
         if text.startswith("+"):
@@ -249,11 +261,16 @@ def check_site(name, st):
 
 
 def main():
-    if not TOKEN or not CHAT_ID:
-        sys.exit("TELEGRAM_TOKEN / TELEGRAM_CHAT_ID 시크릿이 없음")
+    if not TOKEN:
+        sys.exit("TELEGRAM_TOKEN 시크릿이 없음")
     st = load_state()
+    if not CHAT_ID and st.get("chat_id"):
+        set_chat_id(st, st["chat_id"])
     try:
         handle_commands(st)
+        if not CHAT_ID:
+            print("아직 연결 안 됨: 텔레그램에서 봇에게 아무 말이나 보내면 다음 실행 때 연결됨")
+            return
         print("키워드:", st["keywords"])
         for i, name in enumerate(SITES):
             if i:
