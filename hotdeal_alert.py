@@ -24,7 +24,7 @@ BLOCK_BACKOFF_SEC = 3600  # 차단 의심 시 1시간 쉼
 SEEN_MAX = 400  # 사이트별로 기억할 최근 글 번호 수
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-CHAT_ID = str(os.environ.get("TELEGRAM_CHAT_ID", "")  # 비우면 자동 연결)
+CHAT_ID = str(os.environ.get("TELEGRAM_CHAT_ID", ""))  # 비우면 자동 연결
 
 
 # ---------- 상태 ----------
