@@ -1,16 +1,33 @@
 {
   "keywords": [],
-  "tg_offset": 0,
+  "tg_offset": 997728951,
   "sites": {
     "fmkorea": {
       "seen": [],
-      "blocked": false,
-      "blocked_until": 0
+      "blocked": true,
+      "blocked_until": 1792425738.2495131
     },
     "ppomppu": {
-      "seen": [],
+      "seen": [
+        741434,
+        741435,
+        741436,
+        741437,
+        741438,
+        741439,
+        741440,
+        741441,
+        741442,
+        741443,
+        741444,
+        741445,
+        741446,
+        741447,
+        741448
+      ],
       "blocked": false,
       "blocked_until": 0
     }
-  }
+  },
+  "chat_id": "1486357407"
 }
