@@ -262,7 +262,8 @@ def check_site(name, st):
 
 def main():
     if not TOKEN:
-        sys.exit("TELEGRAM_TOKEN 시크릿이 없음")
+        print("TELEGRAM_TOKEN 시크릿이 아직 없음 → 건너뜀")
+        return
     st = load_state()
     if not CHAT_ID and st.get("chat_id"):
         set_chat_id(st, st["chat_id"])
