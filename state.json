@@ -1,5 +1,16 @@
 {
   "keywords": [],
   "tg_offset": 0,
-  "sites": {}
+  "sites": {
+    "fmkorea": {
+      "seen": [],
+      "blocked": false,
+      "blocked_until": 0
+    },
+    "ppomppu": {
+      "seen": [],
+      "blocked": false,
+      "blocked_until": 0
+    }
+  }
 }
