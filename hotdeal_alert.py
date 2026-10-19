@@ -1,11 +1,11 @@
-"""핫딜 키워드 알림: 펨코 핫딜 + 뽐뿌게시판 (GitHub Actions에서 5분마다 실행).
+"""핫딜 키워드 알림: 뽐뿌게시판 + 텔레그램 채널 뽐질(t.me/jirum) (GitHub Actions에서 5분마다 실행).
 
 - 텔레그램 연결: TELEGRAM_CHAT_ID가 없으면 봇에게 처음 말 건 개인 채팅과 자동 연결
 - 텔레그램 명령 처리: /add 키워드, /del 키워드, /list, /help (또는 +키워드, -키워드)
 - 새 글 중 제목/쇼핑몰에 키워드가 들어간 글을 텔레그램으로 알림
 - 상태(키워드, 사이트별 이미 본 글 번호 등)는 state.json에 저장 → 워크플로가 커밋
 
-로컬 파싱 테스트: python -X utf8 hotdeal_alert.py --test fmkorea|ppomppu 저장한파일 키워드1 키워드2
+로컬 파싱 테스트: python -X utf8 hotdeal_alert.py --test ppomppu|jirum 저장한파일 키워드1 키워드2
 """
 import html
 import json
@@ -33,6 +33,7 @@ def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, encoding="utf-8") as f:
             st.update(json.load(f))
+    st["sites"] = {k: v for k, v in st["sites"].items() if k in SITES}  # 뺀 사이트 정리
     for name in SITES:
         st["sites"].setdefault(name, {"seen": [], "blocked": False, "blocked_until": 0})
     for old in ("seen", "blocked", "blocked_until"):  # 펨코 전용 시절 형식 정리
@@ -70,7 +71,7 @@ HELP = ("명령어\n"
         "/list\n"
         "줄여서 +키워드 / -키워드 도 됨\n"
         "※ 5분 간격으로 확인하므로 답장도 몇 분 걸림\n"
-        "대상: 펨코 핫딜, 뽐뿌게시판")
+        "대상: 뽐뿌게시판, 텔레그램 뽐질(t.me/jirum)")
 
 
 def set_chat_id(st, chat_id):
@@ -130,46 +131,6 @@ def clean(s):
     return html.unescape(re.sub(r"<[^>]+>", "", s)).strip()
 
 
-# ---------- 펨코 핫딜 ----------
-FMK_BASE = "https://www.fmkorea.com"
-FMK_URLS = [FMK_BASE + "/hotdeal", FMK_BASE + "/index.php?mid=hotdeal&page=2"]
-
-
-def parse_fmkorea(page):
-    items = []
-    for chunk in re.split(r'<li class="li\s', page)[1:]:
-        m = re.search(r'<h3 class="title"[^>]*>\s*<a href="/(\d+)"[^>]*>.*?'
-                      r'<span class="ellipsis-target">(.*?)</span>', chunk, re.S)
-        if not m:
-            continue
-        info = dict(re.findall(r'(쇼핑몰|가격|배송):\s*<a[^>]*>(.*?)</a>', chunk, re.S))
-        shop, price, ship = (clean(info.get(k, "")) for k in ("쇼핑몰", "가격", "배송"))
-        items.append({
-            "id": int(m.group(1)),
-            "title": clean(m.group(2)),
-            "shop": shop,
-            "detail": " / ".join(x for x in (shop, price, ship) if x),
-            "url": f"{FMK_BASE}/{m.group(1)}",
-        })
-    return items
-
-
-def get_fmkorea(seen):
-    """1페이지가 전부 새 글이면 2페이지까지 확인 (실행 지연 대비)."""
-    found = {}
-    for i, url in enumerate(FMK_URLS):
-        if i:
-            time.sleep(3)
-        items = parse_fmkorea(fetch(url))
-        if not items:
-            raise RuntimeError("목록을 못 읽음 (차단 또는 페이지 구조 변경 의심)")
-        for it in items:
-            found[it["id"]] = it
-        if not seen or any(it["id"] in seen for it in items):
-            break
-    return list(found.values())
-
-
 # ---------- 뽐뿌게시판 (공식 RSS) ----------
 # 게시판 HTML은 봇 요청을 403으로 막아서 RSS를 사용. RSS는 최근 15개만 줌.
 PPOM_RSS = "https://www.ppomppu.co.kr/rss.php?id=ppomppu"
@@ -201,10 +162,58 @@ def get_ppomppu(seen):
     return items
 
 
+# ---------- 텔레그램 채널 뽐질 (t.me/jirum, 공개 미리보기) ----------
+# 펨코는 GitHub 서버 IP를 430으로 막아서 제외함.
+JIRUM_URL = "https://t.me/s/jirum"
+JIRUM_MAX_PAGES = 5  # 한 페이지 20개. 몇 분에 20개 넘게 올라올 때가 있어 이전 글까지 거슬러 봄
+
+
+def parse_jirum(page):
+    items = []
+    for blk in re.split(r'data-post="jirum/', page)[1:]:
+        pid = re.match(r"(\d+)", blk)
+        m = re.search(r'class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', blk, re.S)
+        if not pid or not m:
+            continue
+        text = clean(re.sub(r"<br\s*/?>", "\n", m.group(1)))
+        # 글 끝의 제휴 수수료 안내 문구는 키워드 비교에서 뺌
+        lines = [ln.strip() for ln in text.split("\n")
+                 if ln.strip() and not ln.strip().startswith("✱")]
+        head = [ln.replace("🔥", "").strip() for ln in lines[:2]]
+        items.append({
+            "id": int(pid.group(1)),
+            "title": "\n".join(h for h in head if h),
+            "shop": "",
+            "body": "\n".join(lines),
+            "detail": "",
+            "url": f"https://t.me/jirum/{pid.group(1)}",
+        })
+    return items
+
+
+def get_jirum(seen):
+    found = {}
+    url = JIRUM_URL
+    for i in range(JIRUM_MAX_PAGES):
+        if i:
+            time.sleep(2)
+        items = parse_jirum(fetch(url))
+        if not items:
+            if i:
+                break
+            raise RuntimeError("채널 글을 못 읽음 (차단 또는 형식 변경 의심)")
+        for it in items:
+            found[it["id"]] = it
+        if not seen or any(it["id"] in seen for it in items):
+            break
+        url = f"{JIRUM_URL}?before={min(it['id'] for it in items)}"
+    return list(found.values())
+
+
 # 이름: (텔레그램 표시명, 가져오기 함수, 파서)
 SITES = {
-    "fmkorea": ("펨코", get_fmkorea, parse_fmkorea),
     "ppomppu": ("뽐뿌", get_ppomppu, parse_ppomppu),
+    "jirum": ("뽐질(텔레그램)", get_jirum, parse_jirum),
 }
 
 
@@ -214,7 +223,7 @@ def norm(s):
 
 
 def matched(item, keywords):
-    target = norm(item["title"] + " " + item["shop"])
+    target = norm(" ".join((item["title"], item["shop"], item.get("body", ""))))
     return [k for k in keywords if norm(k) and norm(k) in target]
 
 
