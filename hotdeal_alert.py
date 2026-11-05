@@ -54,8 +54,10 @@ def save_state(st):
 def sync_config(st):
     key = hashlib.sha256(("kw:" + TOKEN).encode()).hexdigest()[:48]
     url = WORKER_KW_URL + "?" + urllib.parse.urlencode({"key": key})
+    # 기본 User-Agent(Python-urllib)는 Cloudflare가 error 1010으로 막아서 이름을 붙임
+    req = urllib.request.Request(url, headers={"User-Agent": "hotdeal-alert-github/1.0"})
     try:
-        with urllib.request.urlopen(url, timeout=20) as r:
+        with urllib.request.urlopen(req, timeout=20) as r:
             cfg = json.load(r)
         st["keywords"] = cfg.get("keywords", [])
         if cfg.get("chat_id"):
