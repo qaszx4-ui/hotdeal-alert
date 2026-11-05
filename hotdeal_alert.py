@@ -1,12 +1,15 @@
-"""핫딜 키워드 알림: 뽐뿌게시판 + 텔레그램 채널 뽐질(t.me/jirum) (GitHub Actions에서 5분마다 실행).
+"""핫딜 키워드 알림 - 뽐뿌게시판 담당 (GitHub Actions에서 실행).
 
-- 텔레그램 연결: TELEGRAM_CHAT_ID가 없으면 봇에게 처음 말 건 개인 채팅과 자동 연결
-- 텔레그램 명령 처리: /add 키워드, /del 키워드, /list, /help (또는 +키워드, -키워드)
+뽐뿌는 Cloudflare 서버 접속을 막아서(2026-11-05 확인) 이 스크립트만 GitHub에서 돌린다.
+텔레그램 채널 뽐질과 텔레그램 명령(/add /del /list)은 Cloudflare Worker(cloudflare/worker.js)가 맡는다.
+
+- 키워드·연결 정보: Worker의 /kw 주소에서 가져옴 (실패하면 state.json에 저장해 둔 마지막 값 사용)
 - 새 글 중 제목/쇼핑몰에 키워드가 들어간 글을 텔레그램으로 알림
-- 상태(키워드, 사이트별 이미 본 글 번호 등)는 state.json에 저장 → 워크플로가 커밋
+- 상태(이미 본 글 번호 등)는 state.json에 저장 → 워크플로가 커밋
 
-로컬 파싱 테스트: python -X utf8 hotdeal_alert.py --test ppomppu|jirum 저장한파일 키워드1 키워드2
+로컬 파싱 테스트: python -X utf8 hotdeal_alert.py --test 저장한RSS.xml 키워드1 키워드2
 """
+import hashlib
 import html
 import json
 import os
@@ -20,24 +23,24 @@ import xml.etree.ElementTree as ET
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
-BLOCK_BACKOFF_SEC = 3600  # 차단 의심 시 1시간 쉼
-SEEN_MAX = 400  # 사이트별로 기억할 최근 글 번호 수
+BLOCK_BACKOFF_SEC = 3600  # 접속 실패 시 1시간 쉼
+SEEN_MAX = 400  # 기억할 최근 글 번호 수
+WORKER_KW_URL = "https://hotdeal-alert.qaszx4.workers.dev/kw"
+LABEL = "뽐뿌"
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-CHAT_ID = str(os.environ.get("TELEGRAM_CHAT_ID", ""))  # 비우면 자동 연결
 
 
 # ---------- 상태 ----------
 def load_state():
-    st = {"keywords": [], "tg_offset": 0, "sites": {}}
+    st = {"keywords": [], "chat_id": "", "ppomppu": {"seen": [], "blocked": False, "blocked_until": 0}}
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, encoding="utf-8") as f:
-            st.update(json.load(f))
-    st["sites"] = {k: v for k, v in st["sites"].items() if k in SITES}  # 뺀 사이트 정리
-    for name in SITES:
-        st["sites"].setdefault(name, {"seen": [], "blocked": False, "blocked_until": 0})
-    for old in ("seen", "blocked", "blocked_until"):  # 펨코 전용 시절 형식 정리
-        st.pop(old, None)
+            old = json.load(f)
+        st["keywords"] = old.get("keywords", [])
+        st["chat_id"] = str(old.get("chat_id", ""))
+        # 이전 형식(sites.ppomppu) 정리
+        st["ppomppu"].update(old.get("ppomppu") or old.get("sites", {}).get("ppomppu", {}))
     return st
 
 
@@ -47,77 +50,34 @@ def save_state(st):
         f.write("\n")
 
 
+# ---------- 키워드 (Worker에서) ----------
+def sync_config(st):
+    key = hashlib.sha256(("kw:" + TOKEN).encode()).hexdigest()[:48]
+    url = WORKER_KW_URL + "?" + urllib.parse.urlencode({"key": key})
+    try:
+        with urllib.request.urlopen(url, timeout=20) as r:
+            cfg = json.load(r)
+        st["keywords"] = cfg.get("keywords", [])
+        if cfg.get("chat_id"):
+            st["chat_id"] = str(cfg["chat_id"])
+    except Exception as e:
+        print("키워드 가져오기 실패, 저장된 값 사용:", e)
+
+
 # ---------- 텔레그램 ----------
-def tg(method, **params):
-    url = f"https://api.telegram.org/bot{TOKEN}/{method}"
-    data = urllib.parse.urlencode(params).encode()
+def send(st, text):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    data = urllib.parse.urlencode({"chat_id": st["chat_id"], "text": text,
+                                   "disable_web_page_preview": "true"}).encode()
     with urllib.request.urlopen(url, data=data, timeout=20) as r:
         return json.load(r)
 
 
-def send(text):
-    tg("sendMessage", chat_id=CHAT_ID, text=text, disable_web_page_preview="true")
+# ---------- 뽐뿌게시판 (공식 RSS) ----------
+# 게시판 HTML은 봇 요청을 403으로 막아서 RSS를 사용. RSS는 최근 15개만 줌.
+PPOM_RSS = "https://www.ppomppu.co.kr/rss.php?id=ppomppu"
 
 
-def kw_list_text(st):
-    if not st["keywords"]:
-        return "등록된 키워드 없음. /add 키워드 로 추가"
-    return "현재 키워드: " + ", ".join(st["keywords"])
-
-
-HELP = ("명령어\n"
-        "/add 키워드  (쉼표로 여러 개: /add 에어팟, 닌텐도)\n"
-        "/del 키워드\n"
-        "/list\n"
-        "줄여서 +키워드 / -키워드 도 됨\n"
-        "※ 5분 간격으로 확인하므로 답장도 몇 분 걸림\n"
-        "대상: 뽐뿌게시판, 텔레그램 뽐질(t.me/jirum)")
-
-
-def set_chat_id(st, chat_id):
-    global CHAT_ID
-    CHAT_ID = str(chat_id)
-    st["chat_id"] = CHAT_ID
-
-
-def handle_commands(st):
-    res = tg("getUpdates", offset=st["tg_offset"], timeout=0)
-    for upd in res.get("result", []):
-        st["tg_offset"] = upd["update_id"] + 1
-        msg = upd.get("message") or {}
-        chat = msg.get("chat", {})
-        if not CHAT_ID and chat.get("type") == "private":
-            set_chat_id(st, chat["id"])  # 봇에게 처음 말 건 사람과 자동 연결
-            send("✅ 연결 완료. 이제 이 채팅으로 알림이 옴\n\n" + HELP)
-            continue
-        if str(chat.get("id")) != CHAT_ID:
-            continue  # 내 채팅 외에는 무시
-        text = (msg.get("text") or "").strip()
-        if text.startswith("+"):
-            cmd, arg = "/add", text[1:]
-        elif text.startswith("-"):
-            cmd, arg = "/del", text[1:]
-        else:
-            cmd, _, arg = text.partition(" ")
-            cmd = cmd.split("@")[0].lower()
-        words = [w.strip() for w in arg.split(",") if w.strip()]
-
-        if cmd == "/add" and words:
-            for w in words:
-                if w not in st["keywords"]:
-                    st["keywords"].append(w)
-            send("추가됨: " + ", ".join(words) + "\n" + kw_list_text(st))
-        elif cmd == "/del" and words:
-            removed = [w for w in words if w in st["keywords"]]
-            st["keywords"] = [k for k in st["keywords"] if k not in words]
-            send(("삭제됨: " + ", ".join(removed) if removed else "없는 키워드") + "\n" + kw_list_text(st))
-        elif cmd == "/list":
-            send(kw_list_text(st))
-        else:
-            send(HELP)
-
-
-# ---------- 공통 ----------
 def fetch(url, referer=None):
     headers = {"User-Agent": UA, "Accept-Language": "ko-KR,ko;q=0.9"}
     if referer:
@@ -129,11 +89,6 @@ def fetch(url, referer=None):
 
 def clean(s):
     return html.unescape(re.sub(r"<[^>]+>", "", s)).strip()
-
-
-# ---------- 뽐뿌게시판 (공식 RSS) ----------
-# 게시판 HTML은 봇 요청을 403으로 막아서 RSS를 사용. RSS는 최근 15개만 줌.
-PPOM_RSS = "https://www.ppomppu.co.kr/rss.php?id=ppomppu"
 
 
 def parse_ppomppu(xml_text):
@@ -149,72 +104,16 @@ def parse_ppomppu(xml_text):
             "id": int(m.group(1)),
             "title": title,  # 제목에 [쇼핑몰]·(가격/배송)이 이미 들어 있음
             "shop": shop.group(1) if shop else "",
-            "detail": "",
             "url": f"https://www.ppomppu.co.kr/zboard/view.php?id=ppomppu&no={m.group(1)}",
         })
     return items
 
 
-def get_ppomppu(seen):
+def get_ppomppu():
     items = parse_ppomppu(fetch(PPOM_RSS, referer="https://www.ppomppu.co.kr/"))
     if not items:
         raise RuntimeError("RSS를 못 읽음 (차단 또는 형식 변경 의심)")
     return items
-
-
-# ---------- 텔레그램 채널 뽐질 (t.me/jirum, 공개 미리보기) ----------
-# 펨코는 GitHub 서버 IP를 430으로 막아서 제외함.
-JIRUM_URL = "https://t.me/s/jirum"
-JIRUM_MAX_PAGES = 5  # 한 페이지 20개. 몇 분에 20개 넘게 올라올 때가 있어 이전 글까지 거슬러 봄
-
-
-def parse_jirum(page):
-    items = []
-    for blk in re.split(r'data-post="jirum/', page)[1:]:
-        pid = re.match(r"(\d+)", blk)
-        m = re.search(r'class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', blk, re.S)
-        if not pid or not m:
-            continue
-        text = clean(re.sub(r"<br\s*/?>", "\n", m.group(1)))
-        # 글 끝의 제휴 수수료 안내 문구는 키워드 비교에서 뺌
-        lines = [ln.strip() for ln in text.split("\n")
-                 if ln.strip() and not ln.strip().startswith("✱")]
-        head = [ln.replace("🔥", "").strip() for ln in lines[:2]]
-        items.append({
-            "id": int(pid.group(1)),
-            "title": "\n".join(h for h in head if h),
-            "shop": "",
-            "body": "\n".join(lines),
-            "detail": "",
-            "url": f"https://t.me/jirum/{pid.group(1)}",
-        })
-    return items
-
-
-def get_jirum(seen):
-    found = {}
-    url = JIRUM_URL
-    for i in range(JIRUM_MAX_PAGES):
-        if i:
-            time.sleep(2)
-        items = parse_jirum(fetch(url))
-        if not items:
-            if i:
-                break
-            raise RuntimeError("채널 글을 못 읽음 (차단 또는 형식 변경 의심)")
-        for it in items:
-            found[it["id"]] = it
-        if not seen or any(it["id"] in seen for it in items):
-            break
-        url = f"{JIRUM_URL}?before={min(it['id'] for it in items)}"
-    return list(found.values())
-
-
-# 이름: (텔레그램 표시명, 가져오기 함수, 파서)
-SITES = {
-    "ppomppu": ("뽐뿌", get_ppomppu, parse_ppomppu),
-    "jirum": ("뽐질(텔레그램)", get_jirum, parse_jirum),
-}
 
 
 # ---------- 매칭·알림 ----------
@@ -223,49 +122,40 @@ def norm(s):
 
 
 def matched(item, keywords):
-    target = norm(" ".join((item["title"], item["shop"], item.get("body", ""))))
+    target = norm(" ".join((item["title"], item["shop"])))
     return [k for k in keywords if norm(k) and norm(k) in target]
 
 
-def format_item(label, item, hits):
-    lines = [f"🔔 {label} [{', '.join(hits)}]", item["title"]]
-    if item["detail"]:
-        lines.append(item["detail"])
-    lines.append(item["url"])
-    return "\n".join(lines)
-
-
-def check_site(name, st):
-    label, getter, _ = SITES[name]
-    ss = st["sites"][name]
+def check(st):
+    ss = st["ppomppu"]
     if time.time() < ss["blocked_until"]:
-        print(f"{label}: 차단 의심으로 대기 중")
+        print(f"{LABEL}: 접속 실패로 쉬는 중")
         return
     seen = set(ss["seen"])
     try:
-        items = getter(seen)
-    except Exception as e:  # HTTP 오류(430/403/429 등) 포함
-        print(f"{label}: 접속 실패 {e}")
+        items = get_ppomppu()
+    except Exception as e:  # HTTP 오류(403/429 등) 포함
+        print(f"{LABEL}: 접속 실패 {e}")
         if not ss["blocked"]:
-            send(f"⚠️ {label} 접속 실패: {e}\n1시간 쉬고 다시 시도함")
+            send(st, f"⚠️ {LABEL} 접속 실패: {e}\n1시간 쉬고 다시 시도함")
         ss["blocked"] = True
         ss["blocked_until"] = time.time() + BLOCK_BACKOFF_SEC
         return
 
     if ss["blocked"]:
-        send(f"✅ {label} 접속 복구됨")
+        send(st, f"✅ {LABEL} 접속 복구됨")
         ss["blocked"] = False
 
     first_run = not seen
     new = sorted((it for it in items if it["id"] not in seen), key=lambda x: x["id"])
     ss["seen"] = sorted(seen | {it["id"] for it in items})[-SEEN_MAX:]
-    print(f"{label}: 새 글 {0 if first_run else len(new)}개")
+    print(f"{LABEL}: 새 글 {0 if first_run else len(new)}개")
     if first_run:
         return  # 첫 실행은 기준점만 잡고 알림 안 보냄
     for it in new:
         hits = matched(it, st["keywords"])
         if hits:
-            send(format_item(label, it, hits))
+            send(st, "\n".join([f"🔔 {LABEL} [{', '.join(hits)}]", it["title"], it["url"]]))
             print("  알림:", it["title"])
 
 
@@ -274,30 +164,25 @@ def main():
         print("TELEGRAM_TOKEN 시크릿이 아직 없음 → 건너뜀")
         return
     st = load_state()
-    if not CHAT_ID and st.get("chat_id"):
-        set_chat_id(st, st["chat_id"])
+    sync_config(st)
     try:
-        handle_commands(st)
-        if not CHAT_ID:
-            print("아직 연결 안 됨: 텔레그램에서 봇에게 아무 말이나 보내면 다음 실행 때 연결됨")
+        if not st["chat_id"]:
+            print("아직 연결 안 됨: 텔레그램에서 봇에게 아무 말이나 보내면 Worker가 연결함")
             return
         print("키워드:", st["keywords"])
-        for i, name in enumerate(SITES):
-            if i:
-                time.sleep(2)
-            check_site(name, st)
+        check(st)
     finally:
         save_state(st)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) >= 4 and sys.argv[1] == "--test":
-        with open(sys.argv[3], encoding="utf-8") as f:
-            parsed = SITES[sys.argv[2]][2](f.read())
-        kws = sys.argv[4:]
+    if len(sys.argv) >= 3 and sys.argv[1] == "--test":
+        with open(sys.argv[2], encoding="utf-8") as f:
+            parsed = parse_ppomppu(f.read())
+        kws = sys.argv[3:]
         for it in parsed:
             mark = "★ " if matched(it, kws) else "  "
-            print(f"{mark}{it['id']} | {it['shop']} | {it['title']} | {it['detail']}")
+            print(f"{mark}{it['id']} | {it['shop']} | {it['title']}")
         print(f"총 {len(parsed)}개")
     else:
         main()

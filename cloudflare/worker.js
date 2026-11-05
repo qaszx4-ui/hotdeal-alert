@@ -1,5 +1,7 @@
 // 핫딜 키워드 알림 — Cloudflare Worker
-// - 2분마다(Cron Trigger) 뽐뿌게시판 RSS + 텔레그램 채널 뽐질(t.me/s/jirum)을 확인
+// - 8분마다(Cron Trigger) 텔레그램 채널 뽐질(t.me/s/jirum)을 확인
+//   (뽐뿌는 Cloudflare 서버 접속을 막아서(2026-11-05 확인: 빈 응답/403) GitHub Actions의 hotdeal_alert.py가 맡음)
+// - GET /kw?key=… : GitHub 쪽이 키워드를 가져가는 주소 (key = SHA-256("kw:"+토큰) 앞 48자)
 // - 텔레그램 명령은 webhook(/tg)으로 즉시 처리: /add /del /list /check /help, +키워드, -키워드
 // - 저장: KV(바인딩 이름 STATE)
 //     "config" = {keywords, chat_id}      ← 텔레그램 명령만 씀
@@ -21,9 +23,9 @@ const HELP = [
   "/add 키워드  (쉼표로 여러 개: /add 에어팟, 닌텐도)",
   "/del 키워드",
   "/list",
-  "/check  지금 바로 확인",
+  "/check  뽐질 지금 바로 확인",
   "줄여서 +키워드 / -키워드 도 됨",
-  "대상: 뽐뿌게시판, 텔레그램 뽐질(t.me/jirum) · 2분마다 확인",
+  "대상: 텔레그램 뽐질(t.me/jirum) 8분마다, 뽐뿌게시판은 GitHub에서 따로 확인(늦을 수 있음)",
 ].join("\n");
 
 export default {
@@ -48,6 +50,14 @@ export default {
         allowed_updates: JSON.stringify(["message"]),
       });
       return Response.json(res);
+    }
+    if (url.pathname === "/kw") {
+      // GitHub Actions(뽐뿌 담당)가 키워드·연결 정보를 가져감
+      if (url.searchParams.get("key") !== await keySecret(env, "kw:")) {
+        return new Response("forbidden", { status: 403 });
+      }
+      const cfg = await loadConfig(env);
+      return Response.json({ keywords: cfg.keywords, chat_id: cfg.chat_id });
     }
     if (url.pathname === "/run") {
       const log = await runCheck(env, true);
@@ -92,11 +102,13 @@ function send(env, chatId, text) {
   return tg(env, "sendMessage", { chat_id: chatId, text, disable_web_page_preview: "true" });
 }
 
-async function hookSecret(env) {
+async function keySecret(env, prefix) {
   // 토큰에서 만든 값이라 시크릿을 따로 넣을 필요 없음
-  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("hook:" + env.TELEGRAM_TOKEN));
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(prefix + env.TELEGRAM_TOKEN));
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 48);
 }
+
+const hookSecret = (env) => keySecret(env, "hook:");
 
 function kwListText(cfg) {
   return cfg.keywords.length ? "현재 키워드: " + cfg.keywords.join(", ") : "등록된 키워드 없음. /add 키워드 로 추가";
@@ -166,34 +178,6 @@ function clean(s) {
   return decode(s.replace(/<[^>]+>/g, "")).trim();
 }
 
-// ---------- 뽐뿌게시판 (공식 RSS, 최근 15개) ----------
-// 게시판 HTML은 봇 요청을 403으로 막아서 RSS를 사용.
-const PPOM_RSS = "https://www.ppomppu.co.kr/rss.php?id=ppomppu";
-
-function parsePpomppu(xml) {
-  const items = [];
-  for (const block of xml.split("<item>").slice(1)) {
-    const title = clean((block.match(/<title>([\s\S]*?)<\/title>/) || [])[1] || "");
-    const no = (block.match(/<link>[^<]*[?&;]no=(\d+)/) || [])[1];
-    if (!no || !title) continue;
-    const shop = (title.match(/^\s*\[([^\]]+)\]/) || [])[1] || "";
-    items.push({
-      id: Number(no),
-      title, // 제목에 [쇼핑몰]·(가격/배송)이 이미 들어 있음
-      shop,
-      body: "",
-      url: `https://www.ppomppu.co.kr/zboard/view.php?id=ppomppu&no=${no}`,
-    });
-  }
-  return items;
-}
-
-async function getPpomppu() {
-  const items = parsePpomppu(await fetchText(PPOM_RSS, "https://www.ppomppu.co.kr/"));
-  if (!items.length) throw new Error("RSS를 못 읽음 (차단 또는 형식 변경 의심)");
-  return items;
-}
-
 // ---------- 텔레그램 채널 뽐질 (t.me/s/jirum 공개 미리보기) ----------
 const JIRUM_URL = "https://t.me/s/jirum";
 
@@ -237,7 +221,6 @@ async function getJirum(seenSet) {
 
 // 이름: [텔레그램 표시명, 가져오기 함수]
 const SITES = {
-  ppomppu: ["뽐뿌", getPpomppu],
   jirum: ["뽐질(텔레그램)", getJirum],
 };
 
@@ -265,7 +248,10 @@ async function runCheck(env, manual) {
 
   for (const [name, [label, getter]] of Object.entries(SITES)) {
     const ss = state[name];
-    if (now < ss.blocked_until) { log.push(`${label}: 접속 실패로 쉬는 중`); continue; }
+    if (!manual && now < ss.blocked_until) { // 수동 확인은 쉬는 중이어도 다시 시도
+      log.push(`${label}: 접속 실패로 쉬는 중 (${ss.last_error || "?"}, ${new Date(ss.blocked_until).toISOString()}까지)`);
+      continue;
+    }
     const seenSet = new Set(ss.seen);
     let items;
     try {
@@ -274,6 +260,7 @@ async function runCheck(env, manual) {
       log.push(`${label}: 접속 실패 ${e.message}`);
       if (!ss.blocked) await send(env, cfg.chat_id, `⚠️ ${label} 접속 실패: ${e.message}\n1시간 쉬고 다시 시도함`);
       ss.blocked = true;
+      ss.last_error = e.message;
       ss.blocked_until = now + BLOCK_BACKOFF_MS;
       continue;
     }
@@ -300,4 +287,4 @@ async function runCheck(env, manual) {
   return log;
 }
 
-export { parsePpomppu, parseJirum, matched }; // 로컬 시험용
+export { parseJirum, matched }; // 로컬 시험용

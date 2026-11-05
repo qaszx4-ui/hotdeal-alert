@@ -1,8 +1,11 @@
 name: hotdeal-alert
 
 on:
-  # 예약 실행은 꺼 둠 (2026-11-05): 실제로 3~10시간 간격으로만 돌았고, GitHub 약관상 상시 봇 용도는 부적합.
-  # 지금은 Cloudflare Worker(cloudflare/worker.js)가 2분마다 확인함.
+  # 뽐뿌게시판만 여기서 확인 (뽐뿌가 Cloudflare 서버 접속을 막아서, 2026-11-05).
+  # 뽐질 채널·텔레그램 명령은 Cloudflare Worker(cloudflare/worker.js)가 8분마다/즉시 처리.
+  # GitHub 예약 실행은 실제로 몇 시간씩 늦게 돌 때가 많음 (2026-11 기록: 평균 153분 간격).
+  schedule:
+    - cron: "*/5 * * * *"
   workflow_dispatch:         # Actions 탭에서 수동 실행
 
 permissions:
