@@ -1,8 +1,8 @@
 name: hotdeal-alert
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"   # 5분마다 (GitHub 최소 간격, 실제로는 몇 분씩 늦을 수 있음)
+  # 예약 실행은 꺼 둠 (2026-11-05): 실제로 3~10시간 간격으로만 돌았고, GitHub 약관상 상시 봇 용도는 부적합.
+  # 지금은 Cloudflare Worker(cloudflare/worker.js)가 2분마다 확인함.
   workflow_dispatch:         # Actions 탭에서 수동 실행
 
 permissions:
